@@ -1,0 +1,420 @@
+diff -r 9d2364203316 -r 12200987356d src/dev/net/etherswitch.cc
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/dev/net/etherswitch.cc	Tue Jan 26 21:56:57 2016 -0600
+@@ -0,0 +1,256 @@
++/*
++ * Copyright (c) 2014 The Regents of The University of Michigan
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met: redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer;
++ * redistributions in binary form must reproduce the above copyright
++ * notice, this list of conditions and the following disclaimer in the
++ * documentation and/or other materials provided with the distribution;
++ * neither the name of the copyright holders nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Authors: Anthony Gutierrez
++ *          Mohammad Alian
++ */
++
++/* @file
++ * Device model for an ethernet switch
++ */
++
++#include "dev/net/etherswitch.hh"
++
++#include "base/random.hh"
++#include "debug/EthernetAll.hh"
++
++using namespace std;
++
++EtherSwitch::EtherSwitch(const Params *p)
++    : EtherObject(p), ttl(p->time_to_live)
++{
++    for (int i = 0; i < p->port_interface_connection_count; ++i) {
++        std::string interfaceName = csprintf("%s.interface%d", name(), i);
++        Interface *interface = new Interface(interfaceName, this,
++                                        p->output_buffer_size, p->delay,
++                                        p->delay_var, p->fabric_speed);
++        interfaces.push_back(interface);
++    }
++}
++
++EtherSwitch::~EtherSwitch()
++{
++    for (auto it : interfaces)
++        delete it;
++
++    interfaces.clear();
++}
++
++EtherInt*
++EtherSwitch::getEthPort(const std::string &if_name, int idx)
++{
++    if (idx < 0 || idx >= interfaces.size())
++        return nullptr;
++
++    Interface *interface = interfaces.at(idx);
++    panic_if(interface->getPeer(), "interface already connected\n");
++
++    return interface;
++}
++
++EtherSwitch::Interface::Interface(const std::string &name,
++                                  EtherSwitch *etherSwitch,
++                                  uint64_t outputBufferSize, Tick delay,
++                                  Tick delay_var, double rate)
++    : EtherInt(name), ticksPerByte(rate), switchDelay(delay),
++      delayVar(delay_var), parent(etherSwitch),
++      outputFifo(outputBufferSize), txEvent(this)
++{
++}
++
++bool
++EtherSwitch::Interface::recvPacket(EthPacketPtr packet)
++{
++    Net::EthAddr destMacAddr(packet->data);
++    Net::EthAddr srcMacAddr(&packet->data[6]);
++
++    learnSenderAddr(srcMacAddr, this);
++    Interface *receiver = lookupDestPort(destMacAddr);
++
++    if (!receiver || destMacAddr.multicast() || destMacAddr.broadcast()) {
++        for (auto it : parent->interfaces)
++            if (it != this)
++                it->enqueue(packet);
++    } else {
++        DPRINTF(Ethernet, "sending packet from MAC %x on port "
++                "%s to MAC %x on port %s\n", uint64_t(srcMacAddr),
++                this->name(), uint64_t(destMacAddr), receiver->name());
++
++        receiver->enqueue(packet);
++    }
++    // At the output port, we either have buffer space (no drop) or
++    // don't (drop packet); in both cases packet is received on
++    // the interface successfully and there is no notion of busy
++    // interface here (as we don't have inputFifo)
++    return true;
++}
++
++void
++EtherSwitch::Interface::enqueue(EthPacketPtr packet)
++{
++    if (!outputFifo.push(packet)) {
++        // output buffer full, drop packet
++        DPRINTF(Ethernet, "output buffer full, drop packet\n");
++        return;
++    }
++
++    // assuming per-interface transmission events,
++    // if there was nothing in the Fifo before push the
++    // current packet, then we need to schedule an event at
++    // curTick + switchingDelay to send this packet out the external link
++    // otherwise, there is already a txEvent scheduled
++    if (!txEvent.scheduled()) {
++        parent->schedule(txEvent, curTick() + switchingDelay());
++    }
++}
++
++void
++EtherSwitch::Interface::transmit()
++{
++    // there should be something in the output queue
++    assert(!outputFifo.empty());
++
++    if (!sendPacket(outputFifo.front())) {
++        DPRINTF(Ethernet, "output port busy...retry later\n");
++        if (!txEvent.scheduled())
++            parent->schedule(txEvent, curTick() + retryTime);
++    } else {
++        DPRINTF(Ethernet, "packet sent: len=%d\n", outputFifo.front()->length);
++        outputFifo.pop();
++        // schedule an event to send the pkt at
++        // the head of queue, if there is any
++        if (!outputFifo.empty()) {
++            parent->schedule(txEvent, curTick() + switchingDelay());
++        }
++    }
++}
++
++Tick
++EtherSwitch::Interface::switchingDelay()
++{
++    Tick delay = (Tick)ceil(((double)outputFifo.front()->length
++                                     * ticksPerByte) + 1.0);
++    if (delayVar != 0)
++                delay += random_mt.random<Tick>(0, delayVar);
++    delay += switchDelay;
++    return delay;
++}
++
++EtherSwitch::Interface*
++EtherSwitch::Interface::lookupDestPort(Net::EthAddr destMacAddr)
++{
++    auto it = parent->forwardingTable.find(uint64_t(destMacAddr));
++
++    if (it == parent->forwardingTable.end()) {
++        DPRINTF(Ethernet, "no entry in forwaring table for MAC: "
++                "%x\n", uint64_t(destMacAddr));
++        return nullptr;
++    }
++
++    // check if this entry is valid based on TTL and lastUseTime
++    if ((curTick() - it->second.lastUseTime) > parent->ttl) {
++        // TTL for this mapping has been expired, so this item is not
++        // valide anymore, let's remove it from the map
++        parent->forwardingTable.erase(it);
++        return nullptr;
++    }
++
++    DPRINTF(Ethernet, "found entry for MAC address %x on port %s\n",
++            uint64_t(destMacAddr), it->second.interface->name());
++    return it->second.interface;
++}
++
++void
++EtherSwitch::Interface::learnSenderAddr(Net::EthAddr srcMacAddr,
++                                          Interface *sender)
++{
++    // learn the port for the sending MAC address
++    auto it = parent->forwardingTable.find(uint64_t(srcMacAddr));
++
++    // if the port for sender's MAC address is not cached,
++    // cache it now, otherwise just update lastUseTime time
++    if (it == parent->forwardingTable.end()) {
++        DPRINTF(Ethernet, "adding forwarding table entry for MAC "
++                " address %x on port %s\n", uint64_t(srcMacAddr),
++                sender->name());
++        EtherSwitch::SwitchTableEntry forwardingTableEntry;
++        forwardingTableEntry.interface = sender;
++        forwardingTableEntry.lastUseTime = curTick();
++        parent->forwardingTable.insert(std::make_pair(uint64_t(srcMacAddr),
++            forwardingTableEntry));
++    } else {
++        it->second.lastUseTime = curTick();
++    }
++}
++
++void
++EtherSwitch::serialize(CheckpointOut &cp) const
++{
++    for (auto it : interfaces)
++        it->serialize(it->name(), cp);
++}
++
++void
++EtherSwitch::unserialize(CheckpointIn &cp)
++{
++    for (auto it : interfaces)
++        it->unserialize(it->name(), cp);
++}
++
++void
++EtherSwitch::Interface::serialize(const std::string &base, CheckpointOut &cp)
++const
++{
++    bool event_scheduled = txEvent.scheduled();
++    paramOut(cp, base + ".event_scheduled", event_scheduled);
++    if (event_scheduled) {
++        Tick event_time = txEvent.when();
++        paramOut(cp, base + ".event_time", event_time);
++    }
++
++    outputFifo.serialize(base + "outputFifo", cp);
++}
++
++void
++EtherSwitch::Interface::unserialize(const std::string &base, CheckpointIn &cp)
++{
++    bool event_scheduled;
++    paramIn(cp, base + ".event_scheduled", event_scheduled);
++    if (event_scheduled) {
++        Tick event_time;
++        paramIn(cp, base + ".event_time", event_time);
++        parent->schedule(txEvent, event_time);
++    }
++
++    outputFifo.unserialize(base + "outputFifo", cp);
++}
++
++EtherSwitch *
++EtherSwitchParams::create()
++{
++    return new EtherSwitch(this);
++}
+diff -r 9d2364203316 -r 12200987356d src/dev/net/Ethernet.py
+--- a/src/dev/net/Ethernet.py	Thu Jan 07 16:33:47 2016 -0600
++++ b/src/dev/net/Ethernet.py	Tue Jan 26 21:56:57 2016 -0600
+@@ -82,6 +82,18 @@
+     dump = Param.EtherDump(NULL, "dump object")
+     speed = Param.NetworkBandwidth('100Mbps', "bus speed in bits per second")
+ 
++class EtherSwitch(EtherObject):
++    type = 'EtherSwitch'
++    cxx_header = "dev/net/etherswitch.hh"
++    dump = Param.EtherDump(NULL, "dump object")
++    fabric_speed = Param.NetworkBandwidth('10Gbps', "switch fabric speed in bits "
++                                          "per second")
++    interface = VectorMasterPort("Ethernet Interface")
++    output_buffer_size = Param.MemorySize('1MB', "size of output port buffers")
++    delay = Param.Latency('0us', "packet transmit delay")
++    delay_var = Param.Latency('0ns', "packet transmit delay variability")
++    time_to_live = Param.Latency('10ms', "time to live of MAC address maping")
++
+ class EtherTap(EtherObject):
+     type = 'EtherTap'
+     cxx_header = "dev/net/ethertap.hh"
+diff -r 9d2364203316 -r 12200987356d src/dev/net/SConscript
+--- a/src/dev/net/SConscript	Thu Jan 07 16:33:47 2016 -0600
++++ b/src/dev/net/SConscript	Tue Jan 26 21:56:57 2016 -0600
+@@ -51,6 +51,7 @@
+ 
+ # Basic Ethernet infrastructure
+ Source('etherbus.cc')
++Source('etherswitch.cc')
+ Source('etherdevice.cc')
+ Source('etherdump.cc')
+ Source('etherint.cc')
+diff -r 9d2364203316 -r 12200987356d src/dev/net/etherswitch.hh
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/dev/net/etherswitch.hh	Tue Jan 26 21:56:57 2016 -0600
+@@ -0,0 +1,123 @@
++/*
++ * Copyright (c) 2014 The Regents of The University of Michigan
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met: redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer;
++ * redistributions in binary form must reproduce the above copyright
++ * notice, this list of conditions and the following disclaimer in the
++ * documentation and/or other materials provided with the distribution;
++ * neither the name of the copyright holders nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * Authors: Anthony Gutierrez
++ *          Mohammad Alian
++ */
++
++/* @file
++ * Device model for an ethernet switch
++ */
++
++#ifndef __DEV_ETHERSWITCH_HH__
++#define __DEV_ETHERSWITCH_HH__
++
++#include <unordered_map>
++
++#include "base/inet.hh"
++#include "dev/net/etherint.hh"
++#include "dev/net/etherlink.hh"
++#include "dev/net/etherobject.hh"
++#include "dev/net/etherpkt.hh"
++#include "dev/net/pktfifo.hh"
++#include "params/EtherSwitch.hh"
++#include "sim/eventq.hh"
++
++class EtherSwitch : public EtherObject
++{
++  public:
++    typedef EtherSwitchParams Params;
++
++    EtherSwitch(const Params *p);
++    ~EtherSwitch();
++
++    const Params * params() const
++    {
++        return dynamic_cast<const Params*>(_params);
++    }
++
++    EtherInt *getEthPort(const std::string &if_name, int idx);
++
++  protected:
++    /**
++     * Model for an Ethernet switch port
++     */
++    class Interface : public EtherInt
++    {
++      public:
++        Interface(const std::string &name, EtherSwitch *_etherSwitch,
++                  uint64_t outputBufferSize, Tick delay, Tick delay_var,
++                  double rate);
++        /**
++         * When a packet is received from a device, route it
++         * through an (several) output queue(s)
++         */
++        bool recvPacket(EthPacketPtr packet);
++        /**
++         * enqueue packet to the outputFifo
++         */
++        void enqueue(EthPacketPtr packet);
++        void sendDone() {}
++        Tick switchingDelay();
++
++        Interface* lookupDestPort(Net::EthAddr destAddr);
++        void learnSenderAddr(Net::EthAddr srcMacAddr, Interface *sender);
++
++        void serialize(const std::string &base, CheckpointOut &cp) const;
++        void unserialize(const std::string &base, CheckpointIn &cp);
++
++      private:
++        const double ticksPerByte;
++        const Tick switchDelay;
++        const Tick delayVar;
++        EtherSwitch *parent;
++        /**
++         * output fifo at each interface
++         */
++        PacketFifo outputFifo;
++        void transmit();
++        EventWrapper<Interface, &Interface::transmit> txEvent;
++    };
++
++    struct SwitchTableEntry {
++            Interface *interface;
++            Tick lastUseTime;
++        };
++
++  private:
++    // time to live for MAC address mappings
++    const double ttl;
++    // all interfaces of the switch
++    std::vector<Interface*> interfaces;
++    // table that maps MAC address to interfaces
++    std::map<uint64_t, SwitchTableEntry> forwardingTable;
++
++    void serialize(CheckpointOut &cp) const override;
++    void unserialize(CheckpointIn &cp) override;
++};
++
++#endif // __DEV_ETHERSWITCH_HH__

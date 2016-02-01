@@ -1,0 +1,35 @@
+--- m5.c
++++ m5.c
+@@ -233,10 +254,12 @@
+ void
+ do_initparam(int argc, char *argv[])
+ {
+-    if (argc != 0)
++    if (argc > 1)
+         usage();
+ 
+-    uint64_t val = m5_initparam();
++    uint64_t key_str[2];
++    parse_str_args_to_regs(argc, argv, key_str, 2);
++    uint64_t val = m5_initparam(key_str[0], key_str[1]);
+     printf("%"PRIu64, val);
+ }
+ 
+@@ -246,7 +269,7 @@
+     if (argc != 0)
+         usage();
+ 
+-    uint64_t param = m5_initparam();
++    uint64_t param = m5_initparam(0, 0);
+ 
+     // run-time, rampup-time, rampdown-time, warmup-time, connections
+     printf("%"PRId64" %"PRId64" %"PRId64" %"PRId64" %"PRId64,
+@@ -298,7 +321,7 @@
+     { "execfile",       do_exec_file,        "" },
+     { "checkpoint",     do_checkpoint,       "[delay [period]]" },
+     { "loadsymbol",     do_load_symbol,      "<address> <symbol>" },
+-    { "initparam",      do_initparam,        "" },
++    { "initparam",      do_initparam,        "[key] // key must be shorter than 16 chars" },
+     { "sw99param",      do_sw99param,        "" },
+ #ifdef linux
+     { "pin",            do_pin,              "<cpu> <program> [args ...]" }

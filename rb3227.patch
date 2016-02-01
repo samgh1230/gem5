@@ -1,0 +1,193 @@
+# Node ID fbce60eab494eb77d81a22bebb4162b2cefb8335
+# Parent  57c340f947c719a5acc3867037d51829c3967671
+diff --git a/src/arch/alpha/isa/decoder.isa b/src/arch/alpha/isa/decoder.isa
+--- a/src/arch/alpha/isa/decoder.isa
++++ b/src/arch/alpha/isa/decoder.isa
+@@ -982,7 +982,7 @@
+                 PseudoInst::loadsymbol(xc->tcBase());
+             }}, No_OpClass, IsNonSpeculative);
+             0x30: initparam({{
+-                Ra = PseudoInst::initParam(xc->tcBase());
++                Ra = PseudoInst::initParam(xc->tcBase(), R16, R17);
+             }});
+             0x40: resetstats({{
+                 PseudoInst::resetstats(xc->tcBase(), R16, R17);
+diff --git a/src/arch/arm/isa/insts/m5ops.isa b/src/arch/arm/isa/insts/m5ops.isa
+--- a/src/arch/arm/isa/insts/m5ops.isa
++++ b/src/arch/arm/isa/insts/m5ops.isa
+@@ -276,13 +276,14 @@
+     exec_output += PredOpExecute.subst(loadsymbolIop)
+ 
+     initparamCode = '''
+-    uint64_t ip_val  = PseudoInst::initParam(xc->tcBase());
++    uint64_t ip_val = PseudoInst::initParam(xc->tcBase(), join32to64(R1, R0),
++                                            join32to64(R3, R2));
+     R0 = bits(ip_val, 31, 0);
+     R1 = bits(ip_val, 63, 32);
+     '''
+ 
+     initparamCode64 = '''
+-    X0 = PseudoInst::initParam(xc->tcBase());
++    X0 = PseudoInst::initParam(xc->tcBase(), X0, X1);
+     '''
+ 
+     initparamIop = InstObjParams("initparam", "Initparam", "PredOp",
+diff --git a/src/arch/x86/isa/decoder/two_byte_opcodes.isa b/src/arch/x86/isa/decoder/two_byte_opcodes.isa
+--- a/src/arch/x86/isa/decoder/two_byte_opcodes.isa
++++ b/src/arch/x86/isa/decoder/two_byte_opcodes.isa
+@@ -173,7 +173,7 @@
+                         PseudoInst::m5fail(xc->tcBase(), Rdi, Rsi);
+                     }}, IsNonSpeculative);
+                     0x30: m5initparam({{
+-                        Rax = PseudoInst::initParam(xc->tcBase());
++                        Rax = PseudoInst::initParam(xc->tcBase(), Rdi, Rsi);
+                     }}, IsNonSpeculative);
+                     0x31: m5loadsymbol({{
+                         PseudoInst::loadsymbol(xc->tcBase());
+diff --git a/src/sim/pseudo_inst.hh b/src/sim/pseudo_inst.hh
+--- a/src/sim/pseudo_inst.hh
++++ b/src/sim/pseudo_inst.hh
+@@ -75,7 +75,7 @@
+     uint64_t offset, Addr filenameAddr);
+ void loadsymbol(ThreadContext *xc);
+ void addsymbol(ThreadContext *tc, Addr addr, Addr symbolAddr);
+-uint64_t initParam(ThreadContext *xc);
++uint64_t initParam(ThreadContext *xc, uint64_t key_str1, uint64_t key_str2);
+ uint64_t rpns(ThreadContext *tc);
+ void wakeCPU(ThreadContext *tc, uint64_t cpuid);
+ void m5exit(ThreadContext *tc, Tick delay);
+diff --git a/src/sim/pseudo_inst.cc b/src/sim/pseudo_inst.cc
+--- a/src/sim/pseudo_inst.cc
++++ b/src/sim/pseudo_inst.cc
+@@ -141,7 +141,7 @@
+         break;
+ 
+       case 0x30: // initparam_func
+-        return initParam(tc);
++        return initParam(tc, args[0], args[1]);
+ 
+       case 0x31: // loadsymbol_func
+         loadsymbol(tc);
+@@ -440,15 +440,43 @@
+ }
+ 
+ uint64_t
+-initParam(ThreadContext *tc)
++initParam(ThreadContext *tc, uint64_t key_str1, uint64_t key_str2)
+ {
+-    DPRINTF(PseudoInst, "PseudoInst::initParam()\n");
++    DPRINTF(PseudoInst, "PseudoInst::initParam() key:%s%s\n", (char *)&key_str1,
++            (char *)&key_str2);
+     if (!FullSystem) {
+         panicFsOnlyPseudoInst("initParam");
+         return 0;
+     }
+ 
+-    return tc->getCpuPtr()->system->init_param;
++    // The key parameter string is passed in via two 64-bit registers. We copy
++    // out the characters from the 64-bit integer variables here and concatenate
++    // them in the key_str character buffer
++    const int len = 2 * sizeof(uint64_t) + 1;
++    char key_str[len];
++    memset(key_str, '\0', len);
++    if (key_str1 == 0) {
++        assert(key_str2 == 0);
++    } else {
++        strncpy(key_str, (char *)&key_str1, sizeof(uint64_t));
++    }
++
++    if (strlen(key_str) == sizeof(uint64_t)) {
++        strncpy(key_str + sizeof(uint64_t), (char *)&key_str2,
++                sizeof(uint64_t));
++    } else {
++        assert(key_str2 == 0);
++    }
++
++    // Compare the key parameter with the known values to select the return
++    // value
++    uint64_t val;
++    if (strlen(key_str) == 0) {
++        val = tc->getCpuPtr()->system->init_param;
++    } else {
++        panic("Unknown key for initparam pseudo instruction");
++    }
++    return val;
+ }
+ 
+ 
+diff --git a/util/m5/m5.c b/util/m5/m5.c
+--- a/util/m5/m5.c
++++ b/util/m5/m5.c
+@@ -83,6 +83,27 @@
+ #undef strto64
+ }
+ 
++void
++parse_str_args_to_regs(int argc, char *argv[], uint64_t regs[], int len)
++{
++    if (argc > 1 || strlen(argv[0]) > len * sizeof(uint64_t))
++        usage();
++
++    int i;
++    for (i = 0; i < len; i++)
++        regs[i] = 0;
++
++    if (argc == 0)
++        return;
++
++    int n;
++    for (n = 0, i = 0; i < len && n < strlen(argv[0]); n++) {
++        *((char *)(&regs[i]) + (n % 8)) = argv[0][n];
++        if ((n % 8) == 7)
++            i++;
++    }
++}
++
+ int
+ read_file(int dest_fid)
+ {
+@@ -233,10 +254,12 @@
+ void
+ do_initparam(int argc, char *argv[])
+ {
+-    if (argc != 0)
++    if (argc > 1)
+         usage();
+ 
+-    uint64_t val = m5_initparam();
++    uint64_t key_str[2];
++    parse_str_args_to_regs(argc, argv, key_str, 2);
++    uint64_t val = m5_initparam(key_str[0], key_str[1]);
+     printf("%"PRIu64, val);
+ }
+ 
+@@ -246,7 +269,7 @@
+     if (argc != 0)
+         usage();
+ 
+-    uint64_t param = m5_initparam();
++    uint64_t param = m5_initparam(0, 0);
+ 
+     // run-time, rampup-time, rampdown-time, warmup-time, connections
+     printf("%"PRId64" %"PRId64" %"PRId64" %"PRId64" %"PRId64,
+@@ -298,7 +321,7 @@
+     { "execfile",       do_exec_file,        "" },
+     { "checkpoint",     do_checkpoint,       "[delay [period]]" },
+     { "loadsymbol",     do_load_symbol,      "<address> <symbol>" },
+-    { "initparam",      do_initparam,        "" },
++    { "initparam",      do_initparam,        "[key] // key must be shorter than 16 chars" },
+     { "sw99param",      do_sw99param,        "" },
+ #ifdef linux
+     { "pin",            do_pin,              "<cpu> <program> [args ...]" }
+diff --git a/util/m5/m5op.h b/util/m5/m5op.h
+--- a/util/m5/m5op.h
++++ b/util/m5/m5op.h
+@@ -48,7 +48,7 @@
+ 
+ void m5_exit(uint64_t ns_delay);
+ void m5_fail(uint64_t ns_delay, uint64_t code);
+-uint64_t m5_initparam(void);
++uint64_t m5_initparam(uint64_t key_str1, uint64_t key_str2);
+ void m5_checkpoint(uint64_t ns_delay, uint64_t ns_period);
+ void m5_reset_stats(uint64_t ns_delay, uint64_t ns_period);
+ void m5_dump_stats(uint64_t ns_delay, uint64_t ns_period);
